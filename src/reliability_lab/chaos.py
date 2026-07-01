@@ -51,7 +51,6 @@ def build_gateway(config: LabConfig, provider_overrides: dict[str, float] | None
 def calculate_recovery_time_ms(gateway: ReliabilityGateway) -> float | None:
     """Derive recovery time from circuit breaker transition logs.
 
-    TODO(student): Implement recovery time calculation:
     1. For each breaker in gateway.breakers.values():
        - Walk breaker.transition_log entries
        - Track when circuit goes to "open" (save ts)
@@ -62,13 +61,24 @@ def calculate_recovery_time_ms(gateway: ReliabilityGateway) -> float | None:
     Each transition_log entry is a dict with keys: "from", "to", "reason", "ts"
     where "ts" is time.time() (epoch seconds).
     """
-    raise NotImplementedError("TODO: implement calculate_recovery_time_ms()")
+    recovery_times = []
+    for breaker in gateway.breakers.values():
+        last_open_ts = None
+        for entry in breaker.transition_log:
+            if entry["to"] == "open":
+                last_open_ts = entry["ts"]
+            elif entry["to"] == "closed" and last_open_ts is not None:
+                recovery_times.append((entry["ts"] - last_open_ts) * 1000)
+                last_open_ts = None
+    if not recovery_times:
+        return None
+    return sum(recovery_times) / len(recovery_times)
 
 
 def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig) -> RunMetrics:
     """Run a single named chaos scenario.
 
-    TODO(student): Implement the scenario runner:
+    Implement the scenario runner:
     1. Build gateway with build_gateway(config, scenario.provider_overrides or None)
     2. Create empty RunMetrics()
     3. Loop config.load_test.requests times:
@@ -86,13 +96,53 @@ def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig
     5. Set recovery_time_ms via calculate_recovery_time_ms(gateway)
     6. Return metrics
     """
-    raise NotImplementedError("TODO: implement run_scenario()")
+    gateway = build_gateway(config, scenario.provider_overrides or None)
+    metrics = RunMetrics()
+
+    for _ in range(config.load_test.requests):
+        query = random.choice(queries)
+        result = gateway.complete(query)
+
+        metrics.total_requests += 1
+        metrics.estimated_cost += result.estimated_cost
+
+        if result.cache_hit:
+            metrics.cache_hits += 1
+            metrics.estimated_cost_saved += 0.001
+
+        if result.route == "fallback":
+            metrics.fallback_successes += 1
+            metrics.successful_requests += 1
+        elif result.route == "static_fallback":
+            metrics.static_fallbacks += 1
+            metrics.failed_requests += 1
+        else:
+            metrics.successful_requests += 1
+
+        if result.latency_ms > 0:
+            metrics.latencies_ms.append(result.latency_ms)
+
+    # Count circuit_open_count
+    open_count = 0
+    for breaker in gateway.breakers.values():
+        for entry in breaker.transition_log:
+            if entry["to"] == "open":
+                open_count += 1
+    metrics.circuit_open_count = open_count
+
+    metrics.recovery_time_ms = calculate_recovery_time_ms(gateway)
+
+    # Close Redis connection if cache is Redis cache to avoid leaks
+    if isinstance(gateway.cache, SharedRedisCache):
+        gateway.cache.close()
+
+    return metrics
 
 
 def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
     """Run all named scenarios from config, or a default run if none defined.
 
-    TODO(student): Add a cache vs no-cache comparison scenario.
+    Add a cache vs no-cache comparison scenario.
     Extend with your own custom scenarios (e.g., cost cap near limit).
     """
     if not config.scenarios:
@@ -105,9 +155,16 @@ def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
     for scenario in config.scenarios:
         result = run_scenario(config, queries, scenario)
 
-        # TODO(student): Define pass/fail criteria per scenario.
-        # Example: primary_timeout_100 passes if fallback_success_rate > 0.9
-        passed = result.successful_requests > 0
+        # Define pass/fail criteria per scenario.
+        if scenario.name == "primary_timeout_100":
+            passed = result.availability >= 0.9 and result.fallback_success_rate >= 0.9
+        elif scenario.name == "primary_flaky_50":
+            passed = result.availability >= 0.75
+        elif scenario.name == "all_healthy":
+            passed = result.availability >= 0.95 and result.circuit_open_count == 0
+        else:
+            passed = result.successful_requests > 0
+        
         combined.scenarios[scenario.name] = "pass" if passed else "fail"
 
         combined.total_requests += result.total_requests
@@ -125,5 +182,28 @@ def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
                 combined.recovery_time_ms = result.recovery_time_ms
             else:
                 combined.recovery_time_ms = (combined.recovery_time_ms + result.recovery_time_ms) / 2
+
+    # Run cache vs no-cache comparison on healthy configuration
+    import copy
+    from reliability_lab.metrics import percentile
+    no_cache_config = copy.deepcopy(config)
+    no_cache_config.cache.enabled = False
+    no_cache_scenario = ScenarioConfig(name="all_healthy_no_cache", description="baseline without cache")
+    no_cache_result = run_scenario(no_cache_config, queries, no_cache_scenario)
+    
+    passed_no_cache = no_cache_result.availability >= 0.95
+    combined.scenarios["all_healthy_no_cache"] = "pass" if passed_no_cache else "fail"
+
+    # Print the cache comparison metrics to console for easy report copying
+    # Find all_healthy scenario with cache
+    healthy_scenario = next((s for s in config.scenarios if s.name == "all_healthy"), None)
+    if healthy_scenario:
+        with_cache_res = run_scenario(config, queries, healthy_scenario)
+        print("\n===================================================")
+        print("    CACHE VS NO-CACHE COMPARISON (all_healthy)")
+        print("===================================================")
+        print(f"With Cache:    P50 = {percentile(with_cache_res.latencies_ms, 50):.2f}ms, P95 = {percentile(with_cache_res.latencies_ms, 95):.2f}ms, Cost = ${with_cache_res.estimated_cost:.6f}, Cache Hit Rate = {with_cache_res.cache_hit_rate:.2%}")
+        print(f"Without Cache: P50 = {percentile(no_cache_result.latencies_ms, 50):.2f}ms, P95 = {percentile(no_cache_result.latencies_ms, 95):.2f}ms, Cost = ${no_cache_result.estimated_cost:.6f}, Cache Hit Rate = {no_cache_result.cache_hit_rate:.2%}")
+        print("===================================================\n")
 
     return combined
